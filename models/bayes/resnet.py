@@ -153,7 +153,7 @@ class ResNet(nn.Module):
 
         # self.fc = nn.Linear(512 * block.expansion, num_classes)
 
-        self._out_features = self.512 * block.expansion
+        self._out_features = 512 * block.expansion
 
         for m in self.modules():
             if isinstance(m, (BBB_Conv2d, BBB_Linear)):

@@ -143,14 +143,26 @@ class ImageClassifier(ClassifierBase):
         predictions = self.head(f)
 
         kl = 0.0
-        for module in self.backbone.modules():
-            if hasattr(module, 'kl_loss'):
-                kl = kl + module.kl_loss()
-        for module in self.bottleneck.modules():
-            if hasattr(module, 'kl_loss'):
-                kl = kl + module.kl_loss()
+        # for module in self.backbone.modules():
+        #     if hasattr(module, 'kl_loss'):
+        #         kl = kl + module.kl_loss()
+        # for module in self.bottleneck.modules():
+        #     if hasattr(module, 'kl_loss'):
+        #         kl = kl + module.kl_loss()
 
         return predictions, f, kl
 
+
+    # def update_params(self, lr_inner, first_order=False, source_params=None, detach=False):
+    #     for name, param in self.named_params(self):
+    #         if not detach:
+    #             grad = param.grad
+    #             if first_order:
+    #                 grad = to_var(grad.detach().data)
+    #             tmp = param - lr_inner * grad
+    #             self.set_param(self, name, tmp)
+    #         else:
+    #             param = param.detach_()  # https://blog.csdn.net/qq_39709535/article/details/81866686
+    #             self.set_param(self, name, param)
 
 

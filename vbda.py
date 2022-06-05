@@ -9,6 +9,7 @@ import sys
 import argparse
 import shutil
 import os.path as osp
+import os
 
 import torch
 import torch.nn as nn
@@ -33,6 +34,9 @@ sys.path.append('.')
 import utils
 import metrics
 import config_bayesian as cfg
+
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = '3'
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -181,51 +185,34 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
         data_time.update(time.time() - end)
 
         # compute output
-        ys_s = torch.zeros(x_s.shape[0], model.num_classes, num_ens).to(device)
-        ys_t = torch.zeros(x_t.shape[0], model.num_classes, num_ens).to(device)
-        fs_s = torch.zeros(x_s.shape[0], model.features_dim, num_ens).to(device)
-        fs_t = torch.zeros(x_t.shape[0], model.features_dim, num_ens).to(device)
-
-        kl_loss = 0.0
 
         for j in range(num_ens):
 
-            y_s, f_s, _kl = model(x_s)
+            y_s, f_s, kl_loss_j = model(x_s)
             y_t, f_t, _ = model(x_t)
 
-            ys_s[:,:,j] = F.log_softmax(y_s, dim=1)
-            ys_t[:,:,j] = F.log_softmax(y_t, dim=1)
-            fs_s[:,:,j] = f_s
-            fs_t[:,:,j] = f_t
+            cls_loss_j = F.cross_entropy(y_s, labels_s)
+            transfer_loss_j = mkmmd_loss(f_s, f_t)
 
-            kl_loss = kl_loss + _kl
+            loss_j = cls_loss_j + transfer_loss_j * args.alph + kl_loss_j * args.beta * 0
 
-        ys_s = utils.logmeanexp(ys_s, dim=2)
-        ys_t = utils.logmeanexp(ys_t, dim=2)
-        fs_s = torch.mean(fs_s, dim=2)
-        fs_t = torch.mean(fs_t, dim=2)
+            loss_j.backward()
 
-        cls_loss = F.nll_loss(ys_s, labels_s, reduction='mean')
-        transfer_loss = mkmmd_loss(fs_s, fs_t)
-        kl_loss = kl_loss / num_ens
+            cls_acc = accuracy(y_s, labels_s)[0]
+            tgt_acc = accuracy(y_t, labels_t)[0]
+            cls_accs.update(cls_acc.item(), x_s.size(0))
+            tgt_accs.update(tgt_acc.item(), x_t.size(0))
+            losses.update(loss_j.item(), x_s.size(0))
+            trans_losses.update(transfer_loss_j.item(), x_s.size(0))
+            # kl_losses.update(kl_loss_j.item())
 
-        # beta
+        for param in model.parameters():
+            # print(param.grad[0])
+            param.grad /= num_ens
+            # print(param.grad[0])
 
-        loss = cls_loss + transfer_loss * args.alph + kl_loss * args.beta
-
-        cls_acc = accuracy(torch.exp(ys_s), labels_s)[0]
-        tgt_acc = accuracy(torch.exp(ys_t), labels_t)[0]
-
-        losses.update(loss.item(), x_s.size(0))
-        cls_accs.update(cls_acc.item(), x_s.size(0))
-        tgt_accs.update(tgt_acc.item(), x_t.size(0))
-        trans_losses.update(transfer_loss.item(), x_s.size(0))
-        kl_losses.update(kl_loss.item())
-
-        # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
         optimizer.step()
+        optimizer.zero_grad()
         lr_scheduler.step()
 
         # measure elapsed time

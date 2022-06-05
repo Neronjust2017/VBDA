@@ -8,6 +8,7 @@ import warnings
 import sys
 import argparse
 import shutil
+import os
 import os.path as osp
 
 import torch
@@ -29,6 +30,9 @@ from common.utils.analysis import collect_feature, tsne, a_distance
 
 sys.path.append('.')
 import utils
+
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -264,6 +268,8 @@ if __name__ == '__main__':
     parser.add_argument("--phase", type=str, default='train', choices=['train', 'test', 'analysis'],
                         help="When phase is 'test', only test the model."
                              "When phase is 'analysis', only analysis the model.")
+
+    parser.add_argument("--gpu", type=str, default='0')
     args = parser.parse_args()
     main(args)
 

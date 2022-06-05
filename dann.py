@@ -9,6 +9,7 @@ import sys
 import argparse
 import shutil
 import os.path as osp
+import os
 
 import torch
 import torch.nn as nn
@@ -29,6 +30,9 @@ from common.utils.analysis import collect_feature, tsne, a_distance
 
 sys.path.append('.')
 import utils
+
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = '1'
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
