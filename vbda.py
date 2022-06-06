@@ -34,16 +34,21 @@ sys.path.append('.')
 import utils
 import metrics
 import config_bayesian as cfg
+import wandb
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = '3'
+os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+wandb.init(project="VBDA", entity="yuhuawei", name="vbda_alph0_beta0_train10_val100")
 
 def main(args: argparse.Namespace):
     logger = CompleteLogger(args.log, args.phase)
     print(args)
+
+    # wandb config
+    wandb.config = vars(args)
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -135,6 +140,8 @@ def main(args: argparse.Namespace):
         # evaluate on validation set
         acc1 = validate(val_loader, classifier, valid_ens, args, device)
 
+        wandb.log({"test_acc": acc1})
+
         # remember best acc@1 and save checkpoint
         torch.save(classifier.state_dict(), logger.get_checkpoint_path('latest'))
         if acc1 > best_acc1:
@@ -185,7 +192,6 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
         data_time.update(time.time() - end)
 
         # compute output
-
         for j in range(num_ens):
 
             y_s, f_s, kl_loss_j = model(x_s)
@@ -194,7 +200,7 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
             cls_loss_j = F.cross_entropy(y_s, labels_s)
             transfer_loss_j = mkmmd_loss(f_s, f_t)
 
-            loss_j = cls_loss_j + transfer_loss_j * args.alph + kl_loss_j * args.beta * 0
+            loss_j = cls_loss_j + transfer_loss_j * args.alph * 0 + kl_loss_j * args.beta * 0
 
             loss_j.backward()
 
@@ -221,6 +227,16 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
 
         if i % args.print_freq == 0:
             progress.display(i)
+
+            # wandb log
+            wandb.log(
+                {
+                    "loss": losses.avg,
+                    "cls_acc": cls_accs.avg,
+                    "tgt_acc": tgt_accs.avg,
+                    "transfer_loss": trans_losses.avg
+                }
+            )
 
 def validate(val_loader, model, num_ens, args, device) -> float:
     batch_time = AverageMeter('Time', ':6.3f')

@@ -30,16 +30,21 @@ from common.utils.analysis import collect_feature, tsne, a_distance
 
 sys.path.append('.')
 import utils
+import wandb
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+os.environ["CUDA_VISIBLE_DEVICES"] = '1'
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+wandb.init(project="VBDA", entity="yuhuawei", name="dan")
 
 def main(args: argparse.Namespace):
     logger = CompleteLogger(args.log, args.phase)
     print(args)
+
+    # wandb config
+    wandb.config = vars(args)
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -126,6 +131,8 @@ def main(args: argparse.Namespace):
         # evaluate on validation set
         acc1 = utils.validate(val_loader, classifier, args, device)
 
+        wandb.log({"test_acc": acc1})
+
         # remember best acc@1 and save checkpoint
         torch.save(classifier.state_dict(), logger.get_checkpoint_path('latest'))
         if acc1 > best_acc1:
@@ -202,6 +209,16 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
 
         if i % args.print_freq == 0:
             progress.display(i)
+
+            # wandb log
+            wandb.log(
+                {
+                    "loss": losses.avg,
+                    "cls_acc": cls_accs.avg,
+                    "tgt_acc": tgt_accs.avg,
+                    "transfer_loss": trans_losses.avg
+                }
+            )
 
 
 if __name__ == '__main__':

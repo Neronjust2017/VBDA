@@ -20,16 +20,20 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 
 sys.path.append('../../..')
-from dalib.modules.domain_discriminator import DomainDiscriminator
-from dalib.adaptation.dann import DomainAdversarialLoss, ImageClassifier
+
 from common.utils.data import ForeverDataIterator
 from common.utils.metric import accuracy
 from common.utils.meter import AverageMeter, ProgressMeter
 from common.utils.logger import CompleteLogger
 from common.utils.analysis import collect_feature, tsne, a_distance
 
+from modules.kernels import GaussianKernel
+from modules.vbda import MultipleKernelMaximumMeanDiscrepancy, ImageClassifier
+
 sys.path.append('.')
 import utils
+import metrics
+import config_bayesian as cfg
 import wandb
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -37,7 +41,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-wandb.init(project="VBDA", entity="yuhuawei", name="dann")
+wandb.init(project="VBDA", entity="yuhuawei", name="vbda_mc_alph0_beta0_train1_val100")
 
 def main(args: argparse.Namespace):
     logger = CompleteLogger(args.log, args.phase)
@@ -78,22 +82,28 @@ def main(args: argparse.Namespace):
 
     train_source_iter = ForeverDataIterator(train_source_loader)
     train_target_iter = ForeverDataIterator(train_target_loader)
-
+    
+    # load config parameters
+    priors = cfg.priors
+    train_ens = cfg.train_ens
+    valid_ens = cfg.valid_ens
+    
     # create model
     print("=> using model '{}'".format(args.arch))
-    backbone = utils.get_model(args.arch, pretrain=not args.scratch)
+    backbone = utils.get_model_vbda(args.arch, priors=priors)
     pool_layer = nn.Identity() if args.no_pool else None
     classifier = ImageClassifier(backbone, num_classes, bottleneck_dim=args.bottleneck_dim,
                                  pool_layer=pool_layer, finetune=not args.scratch).to(device)
-    domain_discri = DomainDiscriminator(in_feature=classifier.features_dim, hidden_size=1024).to(device)
 
     # define optimizer and lr scheduler
-    optimizer = SGD(classifier.get_parameters() + domain_discri.get_parameters(),
-                    args.lr, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
+    optimizer = SGD(classifier.get_parameters(), args.lr, momentum=args.momentum, weight_decay=args.wd, nesterov=True)
     lr_scheduler = LambdaLR(optimizer, lambda x:  args.lr * (1. + args.lr_gamma * float(x)) ** (-args.lr_decay))
 
     # define loss function
-    domain_adv = DomainAdversarialLoss(domain_discri).to(device)
+    mkmmd_loss = MultipleKernelMaximumMeanDiscrepancy(
+        kernels=[GaussianKernel(alpha=2 ** k) for k in range(-3, 2)],
+        linear=not args.non_linear
+    )
 
     # resume from the best checkpoint
     if args.phase != 'train':
@@ -115,21 +125,20 @@ def main(args: argparse.Namespace):
         print("A-distance =", A_distance)
         return
 
-    if args.phase == 'test':
-        acc1 = utils.validate(test_loader, classifier, args, device)
-        print(acc1)
-        return
+    # if args.phase == 'test':
+    #     acc1 = validate(test_loader, classifier, args, device)
+    #     print(acc1)
+    #     return
 
     # start training
     best_acc1 = 0.
     for epoch in range(args.epochs):
-        print("lr:", lr_scheduler.get_last_lr()[0])
         # train for one epoch
-        train(train_source_iter, train_target_iter, classifier, domain_adv, optimizer,
-              lr_scheduler, epoch, args)
+        train(train_source_iter, train_target_iter, classifier, mkmmd_loss, optimizer,
+              lr_scheduler, epoch, train_ens, args)
 
         # evaluate on validation set
-        acc1 = utils.validate(val_loader, classifier, args, device)
+        acc1 = validate(val_loader, classifier, valid_ens, args, device)
 
         wandb.log({"test_acc": acc1})
 
@@ -143,30 +152,31 @@ def main(args: argparse.Namespace):
 
     # evaluate on test set
     classifier.load_state_dict(torch.load(logger.get_checkpoint_path('best')))
-    acc1 = utils.validate(test_loader, classifier, args, device)
+    acc1 = validate(test_loader, classifier, valid_ens, args, device)
     print("test_acc1 = {:3.1f}".format(acc1))
 
     logger.close()
 
 
-def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverDataIterator,
-          model: ImageClassifier, domain_adv: DomainAdversarialLoss, optimizer: SGD,
-          lr_scheduler: LambdaLR, epoch: int, args: argparse.Namespace):
-    batch_time = AverageMeter('Time', ':5.2f')
-    data_time = AverageMeter('Data', ':5.2f')
-    losses = AverageMeter('Loss', ':6.2f')
+def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverDataIterator, model: ImageClassifier,
+          mkmmd_loss: MultipleKernelMaximumMeanDiscrepancy, optimizer: SGD,
+          lr_scheduler: LambdaLR, epoch: int, num_ens: int, args: argparse.Namespace):
+    batch_time = AverageMeter('Time', ':4.2f')
+    data_time = AverageMeter('Data', ':3.1f')
+    losses = AverageMeter('Loss', ':3.2f')
+    trans_losses = AverageMeter('Trans Loss', ':5.4f')
+    kl_losses = AverageMeter('KL Loss', ':5.4f')
     cls_accs = AverageMeter('Cls Acc', ':3.1f')
     tgt_accs = AverageMeter('Tgt Acc', ':3.1f')
-    domain_accs = AverageMeter('Domain Acc', ':3.1f')
-    trans_losses = AverageMeter('Trans Loss', ':5.4f')
+
     progress = ProgressMeter(
         args.iters_per_epoch,
-        [batch_time, data_time, losses, cls_accs, domain_accs],
+        [batch_time, data_time, losses, trans_losses, cls_accs, tgt_accs],
         prefix="Epoch: [{}]".format(epoch))
 
     # switch to train mode
     model.train()
-    domain_adv.train()
+    mkmmd_loss.train()
 
     end = time.time()
     for i in range(args.iters_per_epoch):
@@ -182,24 +192,44 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
         data_time.update(time.time() - end)
 
         # compute output
-        x = torch.cat((x_s, x_t), dim=0)
-        y, f = model(x)
-        y_s, y_t = y.chunk(2, dim=0)
-        f_s, f_t = f.chunk(2, dim=0)
+        ys_s = torch.zeros(x_s.shape[0], model.num_classes, num_ens).to(device)
+        ys_t = torch.zeros(x_t.shape[0], model.num_classes, num_ens).to(device)
+        fs_s = torch.zeros(x_s.shape[0], model.features_dim, num_ens).to(device)
+        fs_t = torch.zeros(x_t.shape[0], model.features_dim, num_ens).to(device)
 
-        cls_loss = F.cross_entropy(y_s, labels_s)
-        transfer_loss = domain_adv(f_s, f_t)
-        domain_acc = domain_adv.domain_discriminator_accuracy
-        loss = cls_loss + transfer_loss * args.trade_off
+        kl_loss = 0.0
 
-        cls_acc = accuracy(y_s, labels_s)[0]
-        tgt_acc = accuracy(y_t, labels_t)[0]
+        for j in range(num_ens):
+            y_s, f_s, _kl = model(x_s)
+            y_t, f_t, _ = model(x_t)
+
+            ys_s[:, :, j] = F.log_softmax(y_s, dim=1)
+            ys_t[:, :, j] = F.log_softmax(y_t, dim=1)
+            fs_s[:, :, j] = f_s
+            fs_t[:, :, j] = f_t
+
+            kl_loss = kl_loss + _kl
+
+        ys_s = utils.logmeanexp(ys_s, dim=2)
+        ys_t = utils.logmeanexp(ys_t, dim=2)
+        fs_s = torch.mean(fs_s, dim=2)
+        fs_t = torch.mean(fs_t, dim=2)
+
+        cls_loss = F.nll_loss(ys_s, labels_s, reduction='mean')
+        transfer_loss = mkmmd_loss(fs_s, fs_t)
+        kl_loss = kl_loss / num_ens
+
+        # beta
+        loss = cls_loss + transfer_loss * args.alph * 0 + kl_loss * args.beta * 0
+
+        cls_acc = accuracy(torch.exp(ys_s), labels_s)[0]
+        tgt_acc = accuracy(torch.exp(ys_t), labels_t)[0]
 
         losses.update(loss.item(), x_s.size(0))
         cls_accs.update(cls_acc.item(), x_s.size(0))
         tgt_accs.update(tgt_acc.item(), x_t.size(0))
-        domain_accs.update(domain_acc.item(), x_s.size(0))
         trans_losses.update(transfer_loss.item(), x_s.size(0))
+        # kl_losses.update(kl_loss.item())
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -220,14 +250,59 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
                     "loss": losses.avg,
                     "cls_acc": cls_accs.avg,
                     "tgt_acc": tgt_accs.avg,
-                    "transfer_loss": trans_losses.avg,
-                    "domain_acc": domain_accs.avg
+                    "transfer_loss": trans_losses.avg
                 }
             )
 
+def validate(val_loader, model, num_ens, args, device) -> float:
+    batch_time = AverageMeter('Time', ':6.3f')
+    losses = AverageMeter('Loss', ':.4e')
+    top1 = AverageMeter('Acc@1', ':6.2f')
+    progress = ProgressMeter(
+        len(val_loader),
+        [batch_time, losses, top1],
+        prefix='Test: ')
+
+    # switch to evaluate mode
+    model.eval()
+
+    with torch.no_grad():
+        end = time.time()
+        for i, (images, target) in enumerate(val_loader):
+
+            images = images.to(device)
+            target = target.to(device)
+
+            # compute output
+            outputs = torch.zeros(images.shape[0], model.num_classes, num_ens).to(device)
+
+            for j in range(num_ens):
+                output, _, _ = model(images)
+                outputs[:, :, j] = F.log_softmax(output, dim=1).data
+
+            outputs = utils.logmeanexp(outputs, dim=2)
+            loss = F.nll_loss(outputs, target)
+
+            # measure accuracy and record loss
+            acc1, = accuracy(torch.exp(outputs), target, topk=(1,))
+
+            losses.update(loss.item(), images.size(0))
+            top1.update(acc1.item(), images.size(0))
+
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if i % args.print_freq == 0:
+                progress.display(i)
+
+        print(' * Acc@1 {top1.avg:.3f}'.format(top1=top1))
+
+
+    return top1.avg
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='DANN for Unsupervised Domain Adaptation')
+    parser = argparse.ArgumentParser(description='DAN for Unsupervised Domain Adaptation')
     # dataset parameters
     parser.add_argument('root', metavar='DIR',
                         help='root path of dataset')
@@ -257,26 +332,29 @@ if __name__ == '__main__':
     parser.add_argument('--no-pool', action='store_true',
                         help='no pool layer after the feature extractor.')
     parser.add_argument('--scratch', action='store_true', help='whether train from scratch.')
-    parser.add_argument('--trade-off', default=1., type=float,
+    parser.add_argument('--non-linear', default=False, action='store_true',
+                        help='whether not use the linear version')
+    parser.add_argument('--alph', default=1., type=float,
                         help='the trade-off hyper-parameter for transfer loss')
+    parser.add_argument('--beta', default=1., type=float,
+                        help='the trade-off hyper-parameter for kl loss')
     # training parameters
     parser.add_argument('-b', '--batch-size', default=32, type=int,
                         metavar='N',
                         help='mini-batch size (default: 32)')
-    parser.add_argument('--lr', '--learning-rate', default=0.01, type=float,
+    parser.add_argument('--lr', '--learning-rate', default=0.003, type=float,
                         metavar='LR', help='initial learning rate', dest='lr')
-    parser.add_argument('--lr-gamma', default=0.001, type=float, help='parameter for lr scheduler')
+    parser.add_argument('--lr-gamma', default=0.0003, type=float, help='parameter for lr scheduler')
     parser.add_argument('--lr-decay', default=0.75, type=float, help='parameter for lr scheduler')
     parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                         help='momentum')
-    parser.add_argument('--wd', '--weight-decay',default=1e-3, type=float,
-                        metavar='W', help='weight decay (default: 1e-3)',
-                        dest='weight_decay')
+    parser.add_argument('--wd', '--weight-decay', default=0.0005, type=float,
+                        metavar='W', help='weight decay (default: 5e-4)')
     parser.add_argument('-j', '--workers', default=2, type=int, metavar='N',
                         help='number of data loading workers (default: 2)')
     parser.add_argument('--epochs', default=20, type=int, metavar='N',
                         help='number of total epochs to run')
-    parser.add_argument('-i', '--iters-per-epoch', default=1000, type=int,
+    parser.add_argument('-i', '--iters-per-epoch', default=500, type=int,
                         help='Number of iterations per epoch')
     parser.add_argument('-p', '--print-freq', default=100, type=int,
                         metavar='N', help='print frequency (default: 100)')
@@ -284,7 +362,7 @@ if __name__ == '__main__':
                         help='seed for initializing training. ')
     parser.add_argument('--per-class-eval', action='store_true',
                         help='whether output per-class accuracy during evaluation')
-    parser.add_argument("--log", type=str, default='dann',
+    parser.add_argument("--log", type=str, default='dan',
                         help="Where to save logs, checkpoints and debugging images.")
     parser.add_argument("--phase", type=str, default='train', choices=['train', 'test', 'analysis'],
                         help="When phase is 'test', only test the model."

@@ -142,7 +142,8 @@ class ImageClassifier(ClassifierBase):
         f = self.bottleneck(f)
         predictions = self.head(f)
 
-        kl = 0.0
+        a = 0
+        kl = torch.tensor(a).to(f.device)
         # for module in self.backbone.modules():
         #     if hasattr(module, 'kl_loss'):
         #         kl = kl + module.kl_loss()
