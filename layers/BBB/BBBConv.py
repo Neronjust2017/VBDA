@@ -24,7 +24,6 @@ class BBBConv2d(ModuleWrapper):
         self.dilation = dilation
         self.groups = 1
         self.use_bias = bias
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
         if priors is None:
             priors = {
@@ -38,12 +37,12 @@ class BBBConv2d(ModuleWrapper):
         self.posterior_mu_initial = priors['posterior_mu_initial']
         self.posterior_rho_initial = priors['posterior_rho_initial']
 
-        self.W_mu = Parameter(torch.empty((out_channels, in_channels, *self.kernel_size), device=self.device))
-        self.W_rho = Parameter(torch.empty((out_channels, in_channels, *self.kernel_size), device=self.device))
+        self.W_mu = Parameter(torch.empty((out_channels, in_channels, *self.kernel_size)))
+        self.W_rho = Parameter(torch.empty((out_channels, in_channels, *self.kernel_size)))
 
         if self.use_bias:
-            self.bias_mu = Parameter(torch.empty((out_channels), device=self.device))
-            self.bias_rho = Parameter(torch.empty((out_channels), device=self.device))
+            self.bias_mu = Parameter(torch.empty((out_channels)))
+            self.bias_rho = Parameter(torch.empty((out_channels)))
         else:
             self.register_parameter('bias_mu', None)
             self.register_parameter('bias_rho', None)
@@ -60,12 +59,12 @@ class BBBConv2d(ModuleWrapper):
 
     def forward(self, input, sample=True):
         if self.training or sample:
-            W_eps = torch.empty(self.W_mu.size()).normal_(0, 1).to(self.device)
+            W_eps = torch.empty(self.W_mu.size()).normal_(0, 1).to(self.W_mu.device)        # 与W_mu的device一致
             self.W_sigma = torch.log1p(torch.exp(self.W_rho))
             weight = self.W_mu + W_eps * self.W_sigma
 
             if self.use_bias:
-                bias_eps = torch.empty(self.bias_mu.size()).normal_(0, 1).to(self.device)
+                bias_eps = torch.empty(self.bias_mu.size()).normal_(0, 1).to(self.bias_mu.device)
                 self.bias_sigma = torch.log1p(torch.exp(self.bias_rho))
                 bias = self.bias_mu + bias_eps * self.bias_sigma
             else:
